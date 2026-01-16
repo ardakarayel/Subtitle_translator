@@ -14,11 +14,35 @@ import tempfile
 import shutil
 import logging
 import argparse
+import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
-import whisper
+
+# Whisper imports - try faster-whisper first, fallback to standard whisper
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+    import whisper
+
+# Translation imports
 from deep_translator import GoogleTranslator
+
+# Optional DeepL support
+try:
+    import deepl
+    DEEPL_AVAILABLE = True
+except ImportError:
+    DEEPL_AVAILABLE = False
+
+# CUDA detection
+try:
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    CUDA_AVAILABLE = False
 
 
 # Configure logging
@@ -43,6 +67,12 @@ class VideoSubtitleProcessor:
     # Supported Whisper models (ordered by size/accuracy)
     WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large']
     
+    # Safe delimiter for batch translation (unlikely to appear in subtitle text)
+    TRANSLATION_DELIMITER = "|||"
+    
+    # Maximum subtitle line length (characters)
+    MAX_SUBTITLE_LINE_LENGTH = 80
+    
     def __init__(
         self,
         output_dir: str = "output",
@@ -50,7 +80,13 @@ class VideoSubtitleProcessor:
         original_dir: str = "orijinalini",
         translated_dir: str = "türkçe altyazı eklenmiş halini",
         burn_subtitles: bool = True,
-        soft_subtitles: bool = False
+        soft_subtitles: bool = False,
+        use_faster_whisper: bool = False,
+        deepl_api_key: Optional[str] = None,
+        use_deepl: bool = False,
+        beam_size: int = 5,
+        best_of: int = 5,
+        max_line_length: int = 80
     ):
         """
         Initialize the processor.
@@ -62,9 +98,25 @@ class VideoSubtitleProcessor:
             translated_dir: Directory for translated videos with subtitles
             burn_subtitles: Whether to burn subtitles into video (default: True)
             soft_subtitles: Whether to also save soft subtitle file (default: False)
+            use_faster_whisper: Use faster-whisper library if available (4-5x faster)
+            deepl_api_key: DeepL API key for translation (optional, requires deepl package)
+            use_deepl: Use DeepL API instead of Google Translate (requires deepl_api_key)
+            beam_size: Whisper beam search size for better accuracy (default: 5)
+            best_of: Number of candidates for Whisper (default: 5)
+            max_line_length: Maximum characters per subtitle line (default: 80)
         """
         if whisper_model not in self.WHISPER_MODELS:
             raise ValueError(f"Invalid Whisper model. Choose from: {self.WHISPER_MODELS}")
+        
+        if use_faster_whisper and not FASTER_WHISPER_AVAILABLE:
+            logger.warning("faster-whisper not available, falling back to standard whisper")
+            use_faster_whisper = False
+        
+        if use_deepl:
+            if not DEEPL_AVAILABLE:
+                raise RuntimeError("DeepL support requires 'deepl' package. Install with: pip install deepl")
+            if not deepl_api_key:
+                raise ValueError("DeepL API key is required when use_deepl=True")
         
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -78,8 +130,21 @@ class VideoSubtitleProcessor:
         self.translator = None
         self.burn_subtitles = burn_subtitles
         self.soft_subtitles = soft_subtitles
+        self.use_faster_whisper = use_faster_whisper
+        self.deepl_api_key = deepl_api_key
+        self.use_deepl = use_deepl
+        self.beam_size = beam_size
+        self.best_of = best_of
+        self.max_line_length = max_line_length
         
+        # Detect GPU availability
+        self.device = "cuda" if CUDA_AVAILABLE else "cpu"
         logger.info(f"Initialized processor with Whisper model: {whisper_model}")
+        logger.info(f"Using device: {self.device}")
+        if use_faster_whisper:
+            logger.info("Using faster-whisper for improved performance")
+        if use_deepl:
+            logger.info("Using DeepL API for translation")
     
     def __enter__(self):
         """Context manager entry."""
@@ -305,15 +370,27 @@ class VideoSubtitleProcessor:
         if self.whisper_model is None:
             logger.info(f"Loading Whisper model: {self.whisper_model_name} (this may take a moment)...")
             try:
-                self.whisper_model = whisper.load_model(self.whisper_model_name)
-                logger.info(f"Whisper model loaded successfully")
+                if self.use_faster_whisper:
+                    # faster-whisper supports device parameter
+                    device = "cuda" if self.device == "cuda" else "cpu"
+                    compute_type = "float16" if device == "cuda" else "int8"
+                    self.whisper_model = WhisperModel(
+                        self.whisper_model_name,
+                        device=device,
+                        compute_type=compute_type
+                    )
+                    logger.info(f"faster-whisper model loaded on {device}")
+                else:
+                    # Standard whisper - device is handled automatically
+                    self.whisper_model = whisper.load_model(self.whisper_model_name, device=self.device)
+                    logger.info(f"Whisper model loaded on {self.device}")
             except Exception as e:
                 logger.error(f"Failed to load Whisper model: {e}")
                 raise RuntimeError(f"Failed to load Whisper model: {e}")
     
     def transcribe_audio(self, audio_path: str, language: str = "fr") -> dict:
         """
-        Transcribe audio using OpenAI Whisper.
+        Transcribe audio using OpenAI Whisper with GPU optimization.
         
         Args:
             audio_path: Path to the audio file
@@ -331,13 +408,52 @@ class VideoSubtitleProcessor:
         self._load_whisper_model()
         
         try:
-            # Transcribe WITHOUT word-level timestamps (not needed, saves memory)
-            result = self.whisper_model.transcribe(
-                audio_path,
-                language=language,
-                word_timestamps=False,  # Not needed for SRT generation
-                verbose=False
-            )
+            if self.use_faster_whisper:
+                # faster-whisper API
+                segments, info = self.whisper_model.transcribe(
+                    audio_path,
+                    language=language,
+                    beam_size=self.beam_size,
+                    best_of=self.best_of,
+                    vad_filter=True  # Voice activity detection
+                )
+                
+                # Convert to standard format compatible with generate_srt
+                result = {
+                    "text": "",
+                    "segments": [],
+                    "language": info.language if hasattr(info, 'language') else language
+                }
+                
+                full_text = []
+                for idx, segment in enumerate(segments):
+                    seg_dict = {
+                        "id": idx,
+                        "seek": int(segment.start * 100),  # Convert to centiseconds
+                        "start": float(segment.start),
+                        "end": float(segment.end),
+                        "text": segment.text.strip(),
+                        "tokens": [],
+                        "temperature": 0.0,
+                        "avg_logprob": -1.0,
+                        "compression_ratio": 1.0,
+                        "no_speech_prob": 0.0
+                    }
+                    result["segments"].append(seg_dict)
+                    full_text.append(segment.text.strip())
+                
+                result["text"] = " ".join(full_text)
+            else:
+                # Standard whisper API with optimized parameters
+                result = self.whisper_model.transcribe(
+                    audio_path,
+                    language=language,
+                    word_timestamps=False,  # Not needed for SRT generation
+                    verbose=False,
+                    beam_size=self.beam_size,
+                    best_of=self.best_of,
+                    temperature=0.0  # Deterministic output
+                )
             
             logger.info("Transcription completed.")
             return result
@@ -349,8 +465,12 @@ class VideoSubtitleProcessor:
         """Initialize translator if not already initialized."""
         if self.translator is None:
             try:
-                self.translator = GoogleTranslator(source='fr', target='tr')
-                logger.debug("Translator initialized")
+                if self.use_deepl:
+                    self.translator = deepl.Translator(self.deepl_api_key)
+                    logger.debug("DeepL translator initialized")
+                else:
+                    self.translator = GoogleTranslator(source='fr', target='tr')
+                    logger.debug("Google translator initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize translator: {e}")
                 raise RuntimeError(f"Failed to initialize translator: {e}")
@@ -391,15 +511,30 @@ class VideoSubtitleProcessor:
         if not non_empty_texts:
             return texts
         
-        # Join all texts with newline delimiter
-        # Using newline as delimiter is safe for subtitles (unlikely to appear in text)
-        joined_text = "\n".join(non_empty_texts)
+        # Join all texts with safe delimiter (|||)
+        # This delimiter is extremely unlikely to appear in subtitle text
+        joined_text = self.TRANSLATION_DELIMITER.join(non_empty_texts)
         
         # Translate the entire batch in ONE API call
+        # NOTE: Future GPT-based translation could be inserted here for better
+        # preservation of slang, technical jargon, and conversational tone.
+        # Example: Use OpenAI API with prompt like "Translate French subtitles to
+        # Turkish, preserving slang and technical terms, use conversational tone."
         translated_joined = None
         for attempt in range(max_retries):
             try:
-                translated_joined = self.translator.translate(joined_text)
+                if self.use_deepl:
+                    # DeepL API
+                    result = self.translator.translate_text(
+                        joined_text,
+                        source_lang="FR",
+                        target_lang="TR"
+                    )
+                    translated_joined = result.text
+                else:
+                    # Google Translate
+                    translated_joined = self.translator.translate(joined_text)
+                
                 if translated_joined:
                     break
             except Exception as e:
@@ -416,8 +551,13 @@ class VideoSubtitleProcessor:
             logger.warning("Batch translation returned empty result, falling back to per-segment translation")
             return self._translate_batch_fallback(texts, max_retries)
         
-        # Split the translated result back by newlines
-        translated_lines = translated_joined.split("\n")
+        # Safety check: ensure delimiter is present (DeepL may lose it)
+        if self.TRANSLATION_DELIMITER not in translated_joined:
+            logger.warning("Delimiter lost in translation, falling back to per-segment translation")
+            return self._translate_batch_fallback(texts, max_retries)
+        
+        # Split the translated result back by delimiter
+        translated_lines = translated_joined.split(self.TRANSLATION_DELIMITER)
         
         # Validate line count matches
         if len(translated_lines) != len(non_empty_texts):
@@ -427,16 +567,98 @@ class VideoSubtitleProcessor:
             )
             return self._translate_batch_fallback(texts, max_retries)
         
-        # Map translated lines back to original positions
+        # Map translated lines back to original positions and split long lines
         result = [""] * len(texts)
         for translated_idx, original_idx in enumerate(position_map):
-            result[original_idx] = translated_lines[translated_idx].strip()
+            if translated_idx < len(translated_lines):
+                translated_text = translated_lines[translated_idx].strip()
+                # Split long lines for better readability
+                result[original_idx] = self._split_long_line(translated_text)
+            else:
+                # Fallback to original if line count mismatch
+                result[original_idx] = texts[original_idx]
         
         # Preserve empty strings in their original positions
         for empty_idx in empty_positions:
             result[empty_idx] = texts[empty_idx]
         
         return result
+    
+    def _split_long_line(self, text: str) -> str:
+        """
+        Split long subtitle lines at meaningful break points.
+        
+        Args:
+            text: Text to split if too long
+            
+        Returns:
+            Text split into multiple lines if needed, otherwise original text
+        """
+        if len(text) <= self.max_line_length:
+            return text
+        
+        # Try to split at sentence boundaries first
+        sentences = re.split(r'([.!?]\s+)', text)
+        current_line = ""
+        lines = []
+        
+        for i in range(0, len(sentences), 2):
+            sentence = sentences[i] + (sentences[i+1] if i+1 < len(sentences) else "")
+            
+            if len(current_line) + len(sentence) <= self.max_line_length:
+                current_line += sentence
+            else:
+                if current_line:
+                    lines.append(current_line.strip())
+                # If single sentence is too long, split at commas
+                if len(sentence) > self.max_line_length:
+                    parts = re.split(r'([,;]\s+)', sentence)
+                    temp_line = ""
+                    for j in range(0, len(parts), 2):
+                        part = parts[j] + (parts[j+1] if j+1 < len(parts) else "")
+                        if len(temp_line) + len(part) <= self.max_line_length:
+                            temp_line += part
+                        else:
+                            if temp_line:
+                                lines.append(temp_line.strip())
+                            temp_line = part
+                    current_line = temp_line
+                else:
+                    current_line = sentence
+        
+        if current_line:
+            lines.append(current_line.strip())
+        
+        # If still too long, force split at spaces
+        if lines and len(lines[-1]) > self.max_line_length:
+            last_line = lines.pop()
+            words = last_line.split()
+            temp_line = ""
+            for word in words:
+                if len(temp_line) + len(word) + 1 <= self.max_line_length:
+                    temp_line += (" " if temp_line else "") + word
+                else:
+                    if temp_line:
+                        lines.append(temp_line)
+                    temp_line = word
+            if temp_line:
+                lines.append(temp_line)
+        
+        return "\n".join(lines) if len(lines) > 1 else text
+    
+    def _soften_turkish_dialogue(self, text: str) -> str:
+        """
+        Optional post-edit to soften Turkish dialogue tone (less formal).
+        Simple regex-based replacements for common formal patterns.
+        """
+        if not text:
+            return text
+        
+        # Soften formal endings - minimal changes for conversational tone
+        # Add more patterns as needed for specific use cases
+        text = re.sub(r'\b(ediyor|ediyoruz|ediyorsunuz)\b', lambda m: m.group(1).replace('ediyor', 'ediyo'), text)
+        
+        return text
     
     def _translate_batch_fallback(self, texts: List[str], max_retries: int = 3) -> List[str]:
         """
@@ -465,8 +687,19 @@ class VideoSubtitleProcessor:
             
             for attempt in range(max_retries):
                 try:
-                    translated_text = self.translator.translate(text)
+                    if self.use_deepl:
+                        result = self.translator.translate_text(
+                            text,
+                            source_lang="FR",
+                            target_lang="TR"
+                        )
+                        translated_text = result.text
+                    else:
+                        translated_text = self.translator.translate(text)
+                    
                     if translated_text:
+                        # Split long lines
+                        translated_text = self._split_long_line(translated_text)
                         break
                 except Exception as e:
                     if attempt < max_retries - 1:
@@ -526,9 +759,11 @@ class VideoSubtitleProcessor:
             
             logger.info(f"Translating batch {batch_num}/{total_batches} ({len(batch)} segments)...")
             translated_batch = self._translate_batch(batch)
+            # Optional post-edit to soften Turkish dialogue
+            translated_batch = [self._soften_turkish_dialogue(text) for text in translated_batch]
             translated_texts.extend(translated_batch)
         
-        # Write SRT file
+        # Write SRT file (supporting multi-line subtitles)
         with open(srt_path, "w", encoding="utf-8") as f:
             for i, (segment, translated_text) in enumerate(zip(segments, translated_texts), start=1):
                 start_time = self._format_timestamp(segment["start"])
@@ -537,7 +772,14 @@ class VideoSubtitleProcessor:
                 # Write SRT entry
                 f.write(f"{i}\n")
                 f.write(f"{start_time} --> {end_time}\n")
-                f.write(f"{translated_text}\n")
+                # Support multi-line subtitles (split by \n)
+                if "\n" in translated_text:
+                    # Multi-line subtitle
+                    lines = translated_text.split("\n")
+                    for line in lines:
+                        f.write(f"{line.strip()}\n")
+                else:
+                    f.write(f"{translated_text}\n")
                 f.write("\n")
         
         logger.info(f"SRT file generated: {srt_path}")
@@ -638,21 +880,30 @@ class VideoSubtitleProcessor:
         # Prepare SRT path for FFmpeg
         srt_escaped = self._prepare_srt_path_for_ffmpeg(srt_path)
         
-        # Build FFmpeg command for subtitle burning
-        # Windows requires proper escaping: use single quotes around path, escape single quotes in path
+        # Build FFmpeg command for subtitle burning with enhanced styling
+        # Enhanced style includes: background box, shadow, better positioning
+        style_params = (
+            "FontSize=24,"
+            "PrimaryColour=&Hffffff,"  # White text
+            "OutlineColour=&H000000,"  # Black outline
+            "BackColour=&H80000000,"  # Semi-transparent black background
+            "Outline=2,"  # Outline thickness
+            "Shadow=2,"  # Shadow offset
+            "MarginV=30,"  # Vertical margin from bottom
+            "Alignment=2"  # Bottom center alignment
+        )
+        
         if os.name == 'nt':  # Windows
             # Escape single quotes in path and wrap in single quotes
             srt_escaped_quoted = srt_escaped.replace("'", "'\\''")
             subtitle_filter = (
                 f"subtitles='{srt_escaped_quoted}':"
-                f"force_style='FontSize=24,PrimaryColour=&Hffffff,"
-                f"OutlineColour=&H000000,Outline=2'"
+                f"force_style='{style_params}'"
             )
         else:
             subtitle_filter = (
                 f"subtitles={srt_escaped}:"
-                f"force_style='FontSize=24,PrimaryColour=&Hffffff,"
-                f"OutlineColour=&H000000,Outline=2'"
+                f"force_style='{style_params}'"
             )
         
         cmd = [
@@ -823,6 +1074,40 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--faster-whisper",
+        action="store_true",
+        help="Use faster-whisper library (4-5x faster, requires: pip install faster-whisper)"
+    )
+    parser.add_argument(
+        "--deepl-api-key",
+        type=str,
+        default=None,
+        help="DeepL API key for translation (requires: pip install deepl)"
+    )
+    parser.add_argument(
+        "--use-deepl",
+        action="store_true",
+        help="Use DeepL API instead of Google Translate (requires --deepl-api-key)"
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        help="Whisper beam search size for better accuracy (default: 5)"
+    )
+    parser.add_argument(
+        "--best-of",
+        type=int,
+        default=5,
+        help="Number of candidates for Whisper (default: 5)"
+    )
+    parser.add_argument(
+        "--max-line-length",
+        type=int,
+        default=80,
+        help="Maximum characters per subtitle line (default: 80)"
+    )
     
     args = parser.parse_args()
     
@@ -834,7 +1119,13 @@ def main():
     with VideoSubtitleProcessor(
         whisper_model=args.model,
         burn_subtitles=not args.no_burn,
-        soft_subtitles=args.soft_subtitles
+        soft_subtitles=args.soft_subtitles,
+        use_faster_whisper=args.faster_whisper,
+        deepl_api_key=args.deepl_api_key,
+        use_deepl=args.use_deepl,
+        beam_size=args.beam_size,
+        best_of=args.best_of,
+        max_line_length=args.max_line_length
     ) as processor:
         try:
             results = processor.process_video(args.video_url, args.output)

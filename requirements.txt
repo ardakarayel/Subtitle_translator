@@ -5,3 +5,7 @@ torchaudio>=2.0.0
 numpy>=1.24.0
 yt-dlp>=2023.10.7
 
+# Optional dependencies for enhanced features:
+# faster-whisper>=0.10.0  # 4-5x faster transcription (install with: pip install faster-whisper)
+# deepl>=1.15.0  # DeepL API for better translation quality (install with: pip install deepl)
+
