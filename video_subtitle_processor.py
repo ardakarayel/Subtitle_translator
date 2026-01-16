@@ -18,7 +18,7 @@ import glob
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
-from deep_translator import GoogleTranslator
+from deep_translator import DeeplTranslator
 
 # Try to import faster-whisper (faster, GPU-accelerated) first, fallback to whisper
 try:
@@ -70,8 +70,12 @@ class VideoSubtitleProcessor:
         original_dir: str = "orijinalini",
         translated_dir: str = "türkçe altyazı eklenmiş halini",
         burn_subtitles: bool = True,
-        soft_subtitles: bool = False
+        soft_subtitles: bool = False,
+        deepl_api_key: str = None
     ):
+        # Default DeepL API key (can be overridden via parameter or environment variable)
+        if deepl_api_key is None:
+            deepl_api_key = os.environ.get('DEEPL_API_KEY', '4c12d0bb-256e-4b91-abd3-768bb8116f97:fx')
         """
         Initialize the processor.
         
@@ -82,6 +86,7 @@ class VideoSubtitleProcessor:
             translated_dir: Directory for translated videos with subtitles
             burn_subtitles: Whether to burn subtitles into video (default: True)
             soft_subtitles: Whether to also save soft subtitle file (default: False)
+            deepl_api_key: DeepL API key for translation (required for DeepL)
         """
         if whisper_model not in self.WHISPER_MODELS:
             raise ValueError(f"Invalid Whisper model. Choose from: {self.WHISPER_MODELS}")
@@ -98,6 +103,7 @@ class VideoSubtitleProcessor:
         self.translator = None
         self.burn_subtitles = burn_subtitles
         self.soft_subtitles = soft_subtitles
+        self.deepl_api_key = deepl_api_key
         
         # Detect GPU availability for optimization
         self.use_gpu = self._detect_gpu()
@@ -329,6 +335,48 @@ class VideoSubtitleProcessor:
             'extract_flat': False,
         }
         
+        # Try to use cookies from browser for age-restricted videos
+        # This allows downloading age-restricted content without manual cookie export
+        browsers_to_try = ['chrome', 'edge', 'firefox', 'opera', 'brave']
+        cookies_used = False
+        cookie_error_message = None
+        
+        for browser in browsers_to_try:
+            try:
+                # Create test options with cookies
+                test_opts = ydl_opts.copy()
+                test_opts['cookiesfrombrowser'] = (browser,)
+                test_opts['quiet'] = True  # Suppress output during test
+                
+                # Try to initialize - this will fail if cookies can't be loaded
+                try:
+                    test_ydl = yt_dlp.YoutubeDL(test_opts)
+                    # Test cookie loading by trying to get cookiejar (this will trigger cookie load)
+                    _ = test_ydl.cookiejar
+                    del test_ydl
+                    # If we got here, cookies are loaded successfully
+                    ydl_opts['cookiesfrombrowser'] = (browser,)
+                    logger.info(f"Using cookies from {browser} for age-restricted videos")
+                    cookies_used = True
+                    break
+                except Exception as cookie_err:
+                    # Cookie loading failed for this browser, try next
+                    error_msg = str(cookie_err).lower()
+                    if 'cookie' in error_msg or 'permission' in error_msg:
+                        cookie_error_message = f"Cookie access failed for {browser}: {cookie_err}"
+                        logger.debug(cookie_error_message)
+                    continue
+            except Exception as e:
+                # Browser not available, try next one
+                continue
+        
+        if not cookies_used:
+            if cookie_error_message and 'permission' in cookie_error_message.lower():
+                logger.warning("⚠️  Cookie access failed - Chrome/Edge may be open. Close browser and retry for age-restricted videos.")
+            else:
+                logger.info("ℹ️  No browser cookies available - age-restricted videos may fail")
+        
+        # Try download with cookies first, fallback to without cookies if it fails
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
@@ -350,8 +398,77 @@ class VideoSubtitleProcessor:
             return str(output_path)
             
         except Exception as e:
-            logger.error(f"Error downloading YouTube video: {e}")
-            raise RuntimeError(f"Failed to download YouTube video: {e}")
+            error_str = str(e)
+            # Check if it's a cookie-related error
+            if 'cookie' in error_str.lower() or 'CookieLoadError' in error_str or 'permission denied' in error_str.lower():
+                logger.warning(f"Cookie loading failed: {error_str}")
+                
+                # Check if this is an age-restricted video error
+                if 'sign in to confirm your age' in error_str.lower() or 'age-restricted' in error_str.lower():
+                    logger.error("=" * 60)
+                    logger.error("❌ AGE-RESTRICTED VIDEO - COOKIES REQUIRED")
+                    logger.error("=" * 60)
+                    logger.error("This video requires authentication. To fix:")
+                    logger.error("1. Close Chrome/Edge/Firefox browser completely")
+                    logger.error("2. Run the script again")
+                    logger.error("3. Or manually export cookies:")
+                    logger.error("   - Install 'Get cookies.txt' Chrome extension")
+                    logger.error("   - Export cookies.txt file")
+                    logger.error("   - Use: python script.py --cookies cookies.txt")
+                    logger.error("=" * 60)
+                    raise RuntimeError(
+                        "Age-restricted video requires cookies. "
+                        "Close your browser and try again, or export cookies manually."
+                    )
+                
+                logger.info("Retrying without cookies...")
+                
+                # Remove cookies and try again
+                if 'cookiesfrombrowser' in ydl_opts:
+                    del ydl_opts['cookiesfrombrowser']
+                
+                # Retry download without cookies
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([video_url])
+                    
+                    # Find the downloaded file
+                    downloaded_file = output_path.with_suffix('.mp4')
+                    if not downloaded_file.exists():
+                        video_files = list(self.temp_dir.glob('*.mp4'))
+                        if video_files:
+                            downloaded_file = max(video_files, key=lambda p: p.stat().st_mtime)
+                        else:
+                            raise FileNotFoundError("Downloaded video file not found")
+                    
+                    # Rename to desired output filename if needed
+                    if downloaded_file != output_path:
+                        downloaded_file.rename(output_path)
+                    
+                    logger.info(f"YouTube video downloaded successfully (without cookies): {output_path}")
+                    return str(output_path)
+                except Exception as retry_e:
+                    retry_error = str(retry_e)
+                    # Check if still age-restricted error
+                    if 'sign in to confirm your age' in retry_error.lower() or 'age-restricted' in retry_error.lower():
+                        logger.error("=" * 60)
+                        logger.error("❌ AGE-RESTRICTED VIDEO - COOKIES REQUIRED")
+                        logger.error("=" * 60)
+                        logger.error("This video requires authentication. To fix:")
+                        logger.error("1. Close Chrome/Edge/Firefox browser completely")
+                        logger.error("2. Run the script again")
+                        logger.error("3. Or manually export cookies from browser")
+                        logger.error("=" * 60)
+                        raise RuntimeError(
+                            "Age-restricted video requires cookies. "
+                            "Close your browser and try again, or export cookies manually."
+                        )
+                    logger.error(f"Error downloading YouTube video (retry without cookies): {retry_e}")
+                    raise RuntimeError(f"Failed to download YouTube video: {retry_e}")
+            else:
+                # Non-cookie error, raise normally
+                logger.error(f"Error downloading YouTube video: {e}")
+                raise RuntimeError(f"Failed to download YouTube video: {e}")
     
     def extract_audio(self, video_path: str) -> str:
         """
@@ -507,11 +624,24 @@ class VideoSubtitleProcessor:
         """Initialize translator if not already initialized."""
         if self.translator is None:
             try:
-                self.translator = GoogleTranslator(source='fr', target='tr')
-                logger.debug("Translator initialized")
+                if not self.deepl_api_key:
+                    raise ValueError(
+                        "DeepL API key is required. "
+                        "Get one from https://www.deepl.com/pro-api or pass deepl_api_key parameter."
+                    )
+                # Free API key formatı ':fx' ile biter
+                is_free_api = self.deepl_api_key.endswith(':fx')
+                
+                self.translator = DeeplTranslator(
+                    api_key=self.deepl_api_key,
+                    source='fr',
+                    target='tr',
+                    use_free_api=is_free_api  # Otomatik algıla: free API key ise True
+                )
+                logger.debug("DeepL translator initialized")
             except Exception as e:
-                logger.error(f"Failed to initialize translator: {e}")
-                raise RuntimeError(f"Failed to initialize translator: {e}")
+                logger.error(f"Failed to initialize DeepL translator: {e}")
+                raise RuntimeError(f"Failed to initialize DeepL translator: {e}")
     
     def _translate_batch(self, texts: List[str], max_retries: int = 3) -> List[str]:
         """
@@ -1039,6 +1169,11 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--deepl-api-key",
+        default=None,
+        help="DeepL API key for translation. If not provided, will be asked interactively."
+    )
     
     args = parser.parse_args()
     
@@ -1067,15 +1202,20 @@ def main():
         if not output_filename.lower().endswith('.mp4'):
             output_filename += '.mp4'
     
+    # Use DeepL API key from argument, environment variable, or default
+    deepl_api_key = args.deepl_api_key or os.environ.get('DEEPL_API_KEY', '4c12d0bb-256e-4b91-abd3-768bb8116f97:fx')
+    
     print(f"\n🚀 İşlem başlatılıyor...")
     print(f"   URL: {video_url}")
-    print(f"   Çıktı: {output_filename}\n")
+    print(f"   Çıktı: {output_filename}")
+    print(f"   Çeviri: DeepL\n")
     
     # Create processor with context manager for automatic cleanup
     with VideoSubtitleProcessor(
         whisper_model=args.model,
         burn_subtitles=not args.no_burn,
-        soft_subtitles=args.soft_subtitles
+        soft_subtitles=args.soft_subtitles,
+        deepl_api_key=deepl_api_key
     ) as processor:
         try:
             results = processor.process_video(video_url, output_filename)
