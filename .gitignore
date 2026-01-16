@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+orijinalini/
+türkçe altyazı eklenmiş halini/
+output/
+original_videos/
+translated_videos/
+*.mp4
+*.wav
+*.srt
+*.m4a
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# Model files (Whisper downloads models automatically)
+*.pt
+*.bin

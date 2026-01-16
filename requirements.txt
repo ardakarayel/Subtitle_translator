@@ -1,0 +1,7 @@
+openai-whisper>=20231117
+deep-translator>=1.11.4
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+yt-dlp>=2023.10.7
+
