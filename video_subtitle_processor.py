@@ -14,11 +14,31 @@ import tempfile
 import shutil
 import logging
 import argparse
+import glob
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
-import whisper
 from deep_translator import GoogleTranslator
+
+# Try to import faster-whisper (faster, GPU-accelerated) first, fallback to whisper
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+    WHISPER_AVAILABLE = False
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+    try:
+        import whisper
+        WHISPER_AVAILABLE = True
+    except ImportError:
+        WHISPER_AVAILABLE = False
+
+# Try to import torch for GPU detection
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 # Configure logging
@@ -37,8 +57,8 @@ class VideoSubtitleProcessor:
     and subtitle burning with robust error handling and performance optimizations.
     """
     
-    # Translation batch size for efficient API usage
-    TRANSLATION_BATCH_SIZE = 50
+    # Translation batch size for efficient API usage (increased for speed)
+    TRANSLATION_BATCH_SIZE = 100
     
     # Supported Whisper models (ordered by size/accuracy)
     WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large']
@@ -79,7 +99,17 @@ class VideoSubtitleProcessor:
         self.burn_subtitles = burn_subtitles
         self.soft_subtitles = soft_subtitles
         
-        logger.info(f"Initialized processor with Whisper model: {whisper_model}")
+        # Detect GPU availability for optimization
+        self.use_gpu = self._detect_gpu()
+        # Use faster-whisper if available (works on both CPU and GPU, but GPU is faster)
+        self.use_faster_whisper = FASTER_WHISPER_AVAILABLE
+        
+        if self.use_faster_whisper:
+            logger.info(f"Initialized with Faster Whisper (GPU accelerated) - model: {whisper_model}")
+        elif FASTER_WHISPER_AVAILABLE:
+            logger.info(f"Initialized with Faster Whisper (CPU) - model: {whisper_model}")
+        else:
+            logger.info(f"Initialized with standard Whisper - model: {whisper_model}")
     
     def __enter__(self):
         """Context manager entry."""
@@ -109,6 +139,38 @@ class VideoSubtitleProcessor:
             )
             return True
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            # Try to find FFmpeg in common Windows locations (WinGet installation)
+            if os.name == 'nt':  # Windows
+                common_paths = [
+                    os.path.join(os.environ.get('LOCALAPPDATA', ''), 
+                                'Microsoft', 'WinGet', 'Packages', 
+                                'Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe',
+                                'ffmpeg-*', 'bin', 'ffmpeg.exe'),
+                    r'C:\ffmpeg\bin\ffmpeg.exe',
+                    os.path.join(os.environ.get('ProgramFiles', ''), 'ffmpeg', 'bin', 'ffmpeg.exe'),
+                ]
+                
+                for pattern in common_paths:
+                    matches = glob.glob(pattern)
+                    if matches:
+                        ffmpeg_path = matches[0]
+                        try:
+                            # Add to PATH for this process
+                            bin_dir = os.path.dirname(ffmpeg_path)
+                            if bin_dir not in os.environ.get('PATH', ''):
+                                os.environ['PATH'] = f"{bin_dir};{os.environ.get('PATH', '')}"
+                            # Test if it works
+                            subprocess.run(
+                                ["ffmpeg", "-version"],
+                                capture_output=True,
+                                check=True,
+                                timeout=5
+                            )
+                            logger.info(f"FFmpeg found at: {ffmpeg_path}")
+                            return True
+                        except:
+                            continue
+            
             return False
     
     def check_ytdlp(self) -> bool:
@@ -118,6 +180,46 @@ class VideoSubtitleProcessor:
             return True
         except ImportError:
             return False
+    
+    def _detect_gpu(self) -> bool:
+        """Detect if GPU is available for acceleration."""
+        if not TORCH_AVAILABLE:
+            return False
+        try:
+            return torch.cuda.is_available()
+        except:
+            return False
+    
+    def _detect_hw_encoder(self) -> Optional[str]:
+        """
+        Detect available hardware encoder for FFmpeg.
+        
+        Returns:
+            Hardware encoder name (h264_nvenc, h264_qsv, h264_videotoolbox) or None
+        """
+        if not self.check_ffmpeg():
+            return None
+        
+        try:
+            # Check for NVIDIA NVENC
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            encoders = result.stdout.lower()
+            
+            if "h264_nvenc" in encoders and self.use_gpu:
+                return "h264_nvenc"
+            elif "h264_qsv" in encoders:
+                return "h264_qsv"  # Intel Quick Sync
+            elif "h264_videotoolbox" in encoders:
+                return "h264_videotoolbox"  # macOS
+        except:
+            pass
+        
+        return None
     
     def _is_youtube_url(self, url: str) -> bool:
         """Check if URL is a YouTube URL."""
@@ -269,17 +371,19 @@ class VideoSubtitleProcessor:
         
         # Extract audio as WAV format optimized for Whisper
         # 16kHz mono is optimal for Whisper
+        # Use multi-threading for faster extraction
         cmd = [
-            "ffmpeg",
-            "-i", video_path,
-            "-vn",  # No video
-            "-acodec", "pcm_s16le",  # PCM 16-bit little-endian
-            "-ar", "16000",  # Sample rate 16kHz (optimal for Whisper)
-            "-ac", "1",  # Mono channel
-            "-y",
-            "-loglevel", "warning",
-            str(audio_path)
-        ]
+                "ffmpeg",
+                "-threads", "0",  # Use all CPU threads
+                "-i", video_path,
+                "-vn",  # No video
+                "-acodec", "pcm_s16le",  # PCM 16-bit little-endian
+                "-ar", "16000",  # Sample rate 16kHz (optimal for Whisper)
+                "-ac", "1",  # Mono channel
+                "-y",
+                "-loglevel", "warning",
+                str(audio_path)
+            ]
         
         try:
             subprocess.run(
@@ -302,18 +406,46 @@ class VideoSubtitleProcessor:
     
     def _load_whisper_model(self):
         """Load Whisper model if not already loaded (lazy loading)."""
-        if self.whisper_model is None:
-            logger.info(f"Loading Whisper model: {self.whisper_model_name} (this may take a moment)...")
+        if self.whisper_model is not None:
+            return
+        
+        logger.info(f"Loading Whisper model: {self.whisper_model_name} (this may take a moment)...")
+        
+        if self.use_faster_whisper:
             try:
-                self.whisper_model = whisper.load_model(self.whisper_model_name)
-                logger.info(f"Whisper model loaded successfully")
+                # Use faster-whisper with GPU if available
+                device = "cuda" if self.use_gpu else "cpu"
+                compute_type = "float16" if self.use_gpu else "int8"  # float16 on GPU, int8 on CPU for speed
+                
+                self.whisper_model = WhisperModel(
+                    self.whisper_model_name,
+                    device=device,
+                    compute_type=compute_type,
+                    num_workers=4 if not self.use_gpu else 1  # Multi-threading on CPU
+                )
+                logger.info(f"Faster Whisper model loaded successfully ({device}, {compute_type})")
+                return
             except Exception as e:
-                logger.error(f"Failed to load Whisper model: {e}")
-                raise RuntimeError(f"Failed to load Whisper model: {e}")
+                logger.warning(f"Failed to load faster-whisper, falling back to standard whisper: {e}")
+                self.use_faster_whisper = False
+        
+        # Fallback to standard whisper
+        if not WHISPER_AVAILABLE:
+            raise RuntimeError(
+                "Neither faster-whisper nor whisper is installed. "
+                "Install one with: pip install faster-whisper OR pip install openai-whisper"
+            )
+        
+        try:
+            self.whisper_model = whisper.load_model(self.whisper_model_name)
+            logger.info("Standard Whisper model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+            raise RuntimeError(f"Failed to load Whisper model: {e}")
     
     def transcribe_audio(self, audio_path: str, language: str = "fr") -> dict:
         """
-        Transcribe audio using OpenAI Whisper.
+        Transcribe audio using Whisper (faster-whisper if available, else standard).
         
         Args:
             audio_path: Path to the audio file
@@ -331,13 +463,39 @@ class VideoSubtitleProcessor:
         self._load_whisper_model()
         
         try:
-            # Transcribe WITHOUT word-level timestamps (not needed, saves memory)
-            result = self.whisper_model.transcribe(
-                audio_path,
-                language=language,
-                word_timestamps=False,  # Not needed for SRT generation
-                verbose=False
-            )
+            if self.use_faster_whisper:
+                # Use faster-whisper API (much faster, especially on GPU)
+                segments, info = self.whisper_model.transcribe(
+                    audio_path,
+                    language=language,
+                    beam_size=5,  # Balanced speed/accuracy
+                    vad_filter=True,  # Voice activity detection for better accuracy
+                    vad_parameters=dict(min_silence_duration_ms=500)
+                )
+                
+                # Convert to standard Whisper format
+                segments_list = []
+                for segment in segments:
+                    segments_list.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text.strip()
+                    })
+                
+                result = {
+                    "text": " ".join([s["text"] for s in segments_list]),
+                    "language": info.language,
+                    "segments": segments_list
+                }
+            else:
+                # Use standard Whisper API
+                result = self.whisper_model.transcribe(
+                    audio_path,
+                    language=language,
+                    word_timestamps=False,  # Not needed for SRT generation
+                    verbose=False,
+                    fp16=self.use_gpu  # Use FP16 on GPU for speed
+                )
             
             logger.info("Transcription completed.")
             return result
@@ -655,18 +813,75 @@ class VideoSubtitleProcessor:
                 f"OutlineColour=&H000000,Outline=2'"
             )
         
-        cmd = [
-            "ffmpeg",
-            "-i", str(video_path),
-            "-vf", subtitle_filter,
-            "-c:v", "libx264",
-            "-c:a", "copy",  # Copy audio without re-encoding
-            "-preset", "medium",  # Balance between speed and compression
-            "-crf", "23",  # Good quality (18-28 range, lower = better)
-            "-y",
-            "-loglevel", "warning",
-            str(output_path)
-        ]
+        # Detect hardware encoder for faster encoding
+        hw_encoder = self._detect_hw_encoder()
+        
+        # Try hardware encoder first, fallback to software if it fails
+        if hw_encoder:
+            logger.info(f"Trying hardware encoder: {hw_encoder} for faster encoding")
+            # Build command with hardware encoder
+            cmd = [
+                "ffmpeg",
+                "-i", str(video_path),
+                "-vf", subtitle_filter,
+                "-c:v", hw_encoder,
+                "-c:a", "copy",  # Copy audio without re-encoding
+            ]
+            
+            # Add encoder-specific options BEFORE output file
+            if hw_encoder == "h264_nvenc":
+                cmd.extend(["-preset", "p4", "-cq", "23"])  # NVIDIA: p4=fast, p1=fastest
+            elif hw_encoder == "h264_qsv":
+                cmd.extend(["-global_quality", "23"])  # Intel QSV
+            elif hw_encoder == "h264_videotoolbox":
+                cmd.extend(["-quality", "70"])  # macOS VideoToolbox
+            
+            # Add output file and other options
+            cmd.extend(["-y", "-loglevel", "warning", str(output_path)])
+            
+            # Try hardware encoder first
+            try:
+                result = subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=7200  # 2 hour timeout for long videos
+                )
+                
+                # Success with hardware encoder
+                if final_output_path:
+                    final_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(output_path, final_output_path)
+                    logger.info(f"Subtitles burned successfully (hardware): {final_output_path}")
+                    return str(final_output_path)
+                else:
+                    logger.info(f"Subtitles burned successfully (hardware): {output_path}")
+                    return str(output_path)
+                    
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                # Hardware encoder failed, fallback to software
+                logger.warning(f"Hardware encoder {hw_encoder} failed, falling back to software encoder: {e}")
+                hw_encoder = None  # Force software encoder
+        
+        # Use software encoder (either because no HW available or HW failed)
+        if not hw_encoder:
+            logger.info("Using software encoder (libx264)")
+            cmd = [
+                "ffmpeg",
+                "-i", str(video_path),
+                "-vf", subtitle_filter,
+                "-c:v", "libx264",
+                "-c:a", "copy",  # Copy audio without re-encoding
+                "-preset", "ultrafast",  # Fastest preset
+                "-crf", "23",  # Good quality (18-28 range, lower = better)
+                "-threads", "0",  # Use all available CPU threads
+                "-y",
+                "-loglevel", "warning",
+                str(output_path)
+            ]
         
         try:
             result = subprocess.run(
@@ -789,12 +1004,13 @@ def main():
     )
     parser.add_argument(
         "video_url",
-        help="URL of the video (m3u8, mp4, or YouTube)"
+        nargs="?",
+        help="URL of the video (m3u8, mp4, or YouTube). If not provided, will be asked interactively."
     )
     parser.add_argument(
         "-o", "--output",
-        default="output_with_subtitles.mp4",
-        help="Output filename (default: output_with_subtitles.mp4)"
+        default=None,
+        help="Output filename. If not provided, will be asked interactively."
     )
     parser.add_argument(
         "-m", "--model",
@@ -830,6 +1046,31 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Interactively ask for video URL if not provided
+    video_url = args.video_url
+    if not video_url:
+        print("=" * 60)
+        print("Video Subtitle Processor")
+        print("=" * 60)
+        video_url = input("\n📹 Video URL'ini girin (YouTube, m3u8, mp4): ").strip()
+        if not video_url:
+            print("❌ Hata: Video URL girilmedi!")
+            sys.exit(1)
+    
+    # Interactively ask for output filename if not provided
+    output_filename = args.output
+    if not output_filename:
+        output_filename = input("💾 Çıktı dosya adını girin (örn: video_tr.mp4) [Enter = output_with_subtitles.mp4]: ").strip()
+        if not output_filename:
+            output_filename = "output_with_subtitles.mp4"
+        # Add .mp4 extension if not present
+        if not output_filename.lower().endswith('.mp4'):
+            output_filename += '.mp4'
+    
+    print(f"\n🚀 İşlem başlatılıyor...")
+    print(f"   URL: {video_url}")
+    print(f"   Çıktı: {output_filename}\n")
+    
     # Create processor with context manager for automatic cleanup
     with VideoSubtitleProcessor(
         whisper_model=args.model,
@@ -837,12 +1078,12 @@ def main():
         soft_subtitles=args.soft_subtitles
     ) as processor:
         try:
-            results = processor.process_video(args.video_url, args.output)
+            results = processor.process_video(video_url, output_filename)
             print("\n" + "=" * 60)
-            print("SUCCESS!")
+            print("✅ BAŞARILI!")
             print("=" * 60)
             for key, path in results.items():
-                print(f"{key.capitalize()}: {path}")
+                print(f"   {key.capitalize()}: {path}")
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             sys.exit(1)
