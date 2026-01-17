@@ -15,6 +15,7 @@ import shutil
 import logging
 import argparse
 import glob
+import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
@@ -822,6 +823,9 @@ class VideoSubtitleProcessor:
                 start_time = self._format_timestamp(segment["start"])
                 end_time = self._format_timestamp(segment["end"])
                 
+                # Post-process translation for better subtitle tone
+                translated_text = self._improve_translation(translated_text)
+                
                 # Write SRT entry
                 f.write(f"{i}\n")
                 f.write(f"{start_time} --> {end_time}\n")
@@ -864,6 +868,81 @@ class VideoSubtitleProcessor:
         
         # Format: HH:MM:SS,mmm
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+    
+    def _improve_translation(self, text: str) -> str:
+        """
+        Post-process DeepL translation to make subtitles more concise and suited 
+        for espionage/drama content (Le Bureau des Légendes style).
+        
+        Applies heuristics:
+        - Removes polite phrases
+        - Removes leading pronouns
+        - Removes exclamation marks
+        - Converts short questions to statements
+        - Removes time fillers
+        - Applies spy terminology dictionary
+        - Adds tension to short sentences
+        - Shortens overly long sentences
+        
+        Args:
+            text: Translated text from DeepL
+            
+        Returns:
+            Improved text
+        """
+        if not text or not text.strip():
+            return text
+        
+        result = text.strip()
+        
+        # 1. Remove polite phrases
+        polite_phrases = ["Lütfen", "Endişelenmeyin", "Sorun değil", "Merhaba", "İyi günler"]
+        for phrase in polite_phrases:
+            result = re.sub(rf'\b{phrase}\b[,\.\s]*', '', result, flags=re.IGNORECASE)
+        
+        # 2. Remove leading pronouns (Ben, Biz, O, Onlar)
+        result = re.sub(r'^(Ben|Biz|O|Onlar)\s+', '', result, flags=re.IGNORECASE)
+        
+        # 3. Remove exclamation marks
+        result = result.replace('!', '')
+        result = result.replace('¡', '')
+        
+        # 4. Convert short questions (≤6 words) to statements
+        words = result.split()
+        if len(words) <= 6 and result.strip().endswith('?'):
+            result = result.rstrip('?') + '.'
+        
+        # 5. Remove time fillers
+        time_fillers = ["şu an", "şu anda", "hemen", "şimdi", "bir an"]
+        for filler in time_fillers:
+            result = re.sub(rf'\b{filler}\b[\s,]*', '', result, flags=re.IGNORECASE)
+        
+        # 6. Apply spy terminology dictionary
+        spy_dict = {
+            'legend': 'kimlik hikâyesi',
+            'asset': 'eleman',
+            'cover': 'paravan',
+            'handler': 'saha sorumlusu',
+            'extraction': 'tahliye'
+        }
+        for en, tr in spy_dict.items():
+            result = re.sub(rf'\b{en}\b', tr, result, flags=re.IGNORECASE)
+        
+        # Recalculate words after all removals/replacements
+        words = result.split()
+        
+        # 7. Add tension to very short sentences (≤3 words)
+        if len(words) <= 3 and not result.endswith('…'):
+            result = result.rstrip('.!?') + '…'
+        
+        # 8. Shorten very long sentences (12+ words) - keep first 10 words
+        if len(words) > 12:
+            result = ' '.join(words[:10]) + '…'
+        
+        # Clean up multiple spaces and trailing punctuation
+        result = re.sub(r'\s+', ' ', result).strip()
+        
+        return result
     
     def _prepare_srt_path_for_ffmpeg(self, srt_path: str) -> str:
         """
