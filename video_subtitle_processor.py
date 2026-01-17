@@ -19,24 +19,46 @@ import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
-from deep_translator import DeeplTranslator
+
+# Try to import OpenAI
+try:
+    from openai import OpenAI  # type: ignore
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    OpenAI = None  # type: ignore
+
+# Try to import DeepL translator
+try:
+    from deep_translator import DeeplTranslator  # type: ignore
+    DEEPL_AVAILABLE = True
+except ImportError:
+    DEEPL_AVAILABLE = False
+    DeeplTranslator = None  # type: ignore
+
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, skip .env loading
 
 # Try to import faster-whisper (faster, GPU-accelerated) first, fallback to whisper
 try:
-    from faster_whisper import WhisperModel
+    from faster_whisper import WhisperModel  # type: ignore
     FASTER_WHISPER_AVAILABLE = True
     WHISPER_AVAILABLE = False
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
     try:
-        import whisper
+        import whisper  # type: ignore
         WHISPER_AVAILABLE = True
     except ImportError:
         WHISPER_AVAILABLE = False
 
 # Try to import torch for GPU detection
 try:
-    import torch
+    import torch  # type: ignore
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -49,6 +71,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# GPT translation system prompt (shared constant to avoid duplication)
+GPT_SYSTEM_PROMPT = (
+    "You are translating subtitles for a French TV series.\n\n"
+    "Translate from French to Turkish.\n"
+    "Preserve meaning and context, not word-for-word translation.\n"
+    "Adapt expressions naturally to Turkish.\n"
+    "Do NOT explain.\n"
+    "Do NOT add or remove lines.\n"
+    "Keep the exact line order.\n"
+    "Keep sentences short and readable for subtitles.\n"
+    "Use a serious, cinematic tone (Netflix / spy-drama style)."
+)
+
 
 class VideoSubtitleProcessor:
     """
@@ -58,8 +93,9 @@ class VideoSubtitleProcessor:
     and subtitle burning with robust error handling and performance optimizations.
     """
     
-    # Translation batch size for efficient API usage (increased for speed)
-    TRANSLATION_BATCH_SIZE = 100
+    # Translation batch size for efficient API usage (character-based for GPT)
+    TRANSLATION_BATCH_SIZE = 100  # Legacy: kept for backward compatibility
+    MAX_CHARS_PER_BATCH = 12000  # Character limit per batch (safe for GPT)
     
     # Supported Whisper models (ordered by size/accuracy)
     WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large']
@@ -72,11 +108,23 @@ class VideoSubtitleProcessor:
         translated_dir: str = "türkçe altyazı eklenmiş halini",
         burn_subtitles: bool = True,
         soft_subtitles: bool = False,
-        deepl_api_key: str = None
+        openai_api_key: str = None,
+        deepl_api_key: str = None,
+        translator: str = "gpt"
     ):
-        # Default DeepL API key (can be overridden via parameter or environment variable)
+        # Translator backend selection
+        if translator not in ["deepl", "gpt"]:
+            raise ValueError(f"Invalid translator. Choose from: 'deepl' or 'gpt'")
+        self.translator_backend = translator
+        
+        # OpenAI API key (required for GPT translation)
+        if openai_api_key is None:
+            openai_api_key = os.environ.get('OPENAI_API_KEY')
+        
+        # DeepL API key (required for DeepL translation)
         if deepl_api_key is None:
-            deepl_api_key = os.environ.get('DEEPL_API_KEY', '4c12d0bb-256e-4b91-abd3-768bb8116f97:fx')
+            deepl_api_key = os.environ.get('DEEPL_API_KEY')
+        
         """
         Initialize the processor.
         
@@ -87,7 +135,9 @@ class VideoSubtitleProcessor:
             translated_dir: Directory for translated videos with subtitles
             burn_subtitles: Whether to burn subtitles into video (default: True)
             soft_subtitles: Whether to also save soft subtitle file (default: False)
-            deepl_api_key: DeepL API key for translation (required for DeepL)
+            openai_api_key: OpenAI API key for translation (required when translator='gpt')
+            deepl_api_key: DeepL API key for translation (required when translator='deepl')
+            translator: Translation backend ('deepl' or 'gpt', default: 'deepl')
         """
         if whisper_model not in self.WHISPER_MODELS:
             raise ValueError(f"Invalid Whisper model. Choose from: {self.WHISPER_MODELS}")
@@ -98,13 +148,27 @@ class VideoSubtitleProcessor:
         self.original_videos_dir.mkdir(exist_ok=True)
         self.translated_videos_dir = Path(translated_dir)
         self.translated_videos_dir.mkdir(exist_ok=True)
+        
+        # GPT translated videos directory
+        self.gpt_translated_dir = Path("gpt-translate")
+        self.gpt_translated_dir.mkdir(exist_ok=True)
+        
         self.temp_dir = Path(tempfile.mkdtemp(prefix="video_subtitle_"))
         self.whisper_model_name = whisper_model
         self.whisper_model = None
         self.translator = None
         self.burn_subtitles = burn_subtitles
         self.soft_subtitles = soft_subtitles
+        self.openai_api_key = openai_api_key
         self.deepl_api_key = deepl_api_key
+        
+        # Silence gap threshold for subtitle freeze fix
+        self.SILENCE_GAP_THRESHOLD = 1.5  # seconds
+        
+        # Track if GPT cost has been logged (to avoid spam)
+        self._gpt_cost_logged = False
+        
+        logger.info(f"Using translator: {self.translator_backend.upper()}")
         
         # Detect GPU availability for optimization
         self.use_gpu = self._detect_gpu()
@@ -183,7 +247,7 @@ class VideoSubtitleProcessor:
     def check_ytdlp(self) -> bool:
         """Check if yt-dlp is installed and accessible."""
         try:
-            import yt_dlp
+            import yt_dlp  # type: ignore
             return True
         except ImportError:
             return False
@@ -316,7 +380,7 @@ class VideoSubtitleProcessor:
             RuntimeError: If download fails
         """
         try:
-            import yt_dlp
+            import yt_dlp  # type: ignore
         except ImportError:
             raise ImportError(
                 "yt-dlp is required for YouTube downloads. "
@@ -335,6 +399,11 @@ class VideoSubtitleProcessor:
             'no_warnings': False,
             'extract_flat': False,
         }
+        
+        # Use cookies.txt if provided
+        if hasattr(self, "cookies_path") and self.cookies_path:
+            ydl_opts["cookies"] = self.cookies_path
+            logger.info(f"Using cookies file: {self.cookies_path}")
         
         # Try to use cookies from browser for age-restricted videos
         # This allows downloading age-restricted content without manual cookie export
@@ -622,27 +691,51 @@ class VideoSubtitleProcessor:
             raise RuntimeError(f"Failed to transcribe audio: {e}")
     
     def _init_translator(self):
-        """Initialize translator if not already initialized."""
+        """Initialize translator (DeepL or GPT) if not already initialized."""
         if self.translator is None:
-            try:
-                if not self.deepl_api_key:
-                    raise ValueError(
-                        "DeepL API key is required. "
-                        "Get one from https://www.deepl.com/pro-api or pass deepl_api_key parameter."
+            if self.translator_backend == "deepl":
+                try:
+                    if not DEEPL_AVAILABLE:
+                        raise ImportError(
+                            "DeepL package is not installed. "
+                            "Install it with: pip install deep-translator"
+                        )
+                    if not self.deepl_api_key:
+                        raise ValueError(
+                            "DeepL API key is required. "
+                            "Get one from https://www.deepl.com/pro-api or set DEEPL_API_KEY environment variable."
+                        )
+                    # Free API key formatı ':fx' ile biter
+                    is_free_api = self.deepl_api_key.endswith(':fx')
+                    
+                    self.translator = DeeplTranslator(
+                        api_key=self.deepl_api_key,
+                        source='fr',
+                        target='tr',
+                        use_free_api=is_free_api  # Otomatik algıla: free API key ise True
                     )
-                # Free API key formatı ':fx' ile biter
-                is_free_api = self.deepl_api_key.endswith(':fx')
-                
-                self.translator = DeeplTranslator(
-                    api_key=self.deepl_api_key,
-                    source='fr',
-                    target='tr',
-                    use_free_api=is_free_api  # Otomatik algıla: free API key ise True
-                )
-                logger.debug("DeepL translator initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize DeepL translator: {e}")
-                raise RuntimeError(f"Failed to initialize DeepL translator: {e}")
+                    logger.debug("DeepL translator initialized")
+                except Exception as e:
+                    logger.error(f"Failed to initialize DeepL translator: {e}")
+                    raise RuntimeError(f"Failed to initialize DeepL translator: {e}")
+            elif self.translator_backend == "gpt":
+                try:
+                    if not OPENAI_AVAILABLE:
+                        raise ImportError(
+                            "OpenAI package is not installed. "
+                            "Install it with: pip install openai"
+                        )
+                    if not self.openai_api_key:
+                        raise ValueError(
+                            "OpenAI API key is required. "
+                            "Get one from https://platform.openai.com/api-keys or set OPENAI_API_KEY environment variable."
+                        )
+                    
+                    self.translator = OpenAI(api_key=self.openai_api_key)
+                    logger.debug("OpenAI translator initialized with model: gpt-5-mini")
+                except Exception as e:
+                    logger.error(f"Failed to initialize OpenAI translator: {e}")
+                    raise RuntimeError(f"Failed to initialize OpenAI translator: {e}")
     
     def _translate_batch(self, texts: List[str], max_retries: int = 3) -> List[str]:
         """
@@ -680,15 +773,45 @@ class VideoSubtitleProcessor:
         if not non_empty_texts:
             return texts
         
-        # Join all texts with newline delimiter
-        # Using newline as delimiter is safe for subtitles (unlikely to appear in text)
-        joined_text = "\n".join(non_empty_texts)
+        # Join all texts with numbered format to prevent line mismatch
+        # Format: [1] text1\n[2] text2\n[3] text3
+        # This ensures GPT preserves exact line count even if it modifies newlines
+        numbered_texts = [f"[{i+1}] {text}" for i, text in enumerate(non_empty_texts)]
+        joined_text = "\n".join(numbered_texts)
         
         # Translate the entire batch in ONE API call
         translated_joined = None
         for attempt in range(max_retries):
             try:
-                translated_joined = self.translator.translate(joined_text)
+                if self.translator_backend == "deepl":
+                    # DeepL translation
+                    translated_joined = self.translator.translate(joined_text)
+                elif self.translator_backend == "gpt":
+                    # GPT translation with Responses API
+                    # Log cost estimation only once to avoid spam
+                    if not self._gpt_cost_logged:
+                        logger.info("Using GPT-5-mini (~$0.05 per hour of video)")
+                        self._gpt_cost_logged = True
+                    
+                    response = self.translator.responses.create(
+                        model="gpt-5-mini",
+                        # temperature parameter removed - GPT-5-mini doesn't support it
+                        input=[
+                            {"role": "system", "content": GPT_SYSTEM_PROMPT},
+                            {"role": "user", "content": f"TEXT:\n{joined_text}\n\nPreserve the [number] format exactly."}
+                        ]
+                    )
+                    
+                    # Log actual token usage if available
+                    if hasattr(response, "usage") and response.usage:
+                        logger.info(
+                            f"GPT usage | input={response.usage.input_tokens} "
+                            f"output={response.usage.output_tokens} "
+                            f"total={response.usage.input_tokens + response.usage.output_tokens}"
+                        )
+                    
+                    translated_joined = response.output_text.strip()
+                
                 if translated_joined:
                     break
             except Exception as e:
@@ -705,21 +828,33 @@ class VideoSubtitleProcessor:
             logger.warning("Batch translation returned empty result, falling back to per-segment translation")
             return self._translate_batch_fallback(texts, max_retries)
         
-        # Split the translated result back by newlines
-        translated_lines = translated_joined.split("\n")
+        # Extract numbered lines using regex: [1] text, [2] text, etc.
+        # This is more reliable than newline splitting because GPT might modify newlines
+        # Pattern matches: [1] text, [2] text, etc. (handles multi-line text between brackets)
+        line_pattern = r'\[(\d+)\]\s*(.*?)(?=\[\d+\]|$)'
+        matches = re.findall(line_pattern, translated_joined, re.DOTALL | re.MULTILINE)
         
-        # Validate line count matches
-        if len(translated_lines) != len(non_empty_texts):
-            logger.warning(
-                f"Translated line count ({len(translated_lines)}) doesn't match "
-                f"input count ({len(non_empty_texts)}), falling back to per-segment translation"
+        # Validate we got the expected number of lines
+        if len(matches) != len(non_empty_texts):
+            logger.error(
+                f"GPT line mismatch: input={len(non_empty_texts)}, output={len(matches)}. "
+                "Falling back to per-segment translation."
             )
             return self._translate_batch_fallback(texts, max_retries)
+        
+        # Sort by line number and extract text (in case GPT reorders)
+        sorted_matches = sorted(matches, key=lambda x: int(x[0]))
+        translated_texts_by_number = {int(num): text.strip() for num, text in sorted_matches}
         
         # Map translated lines back to original positions
         result = [""] * len(texts)
         for translated_idx, original_idx in enumerate(position_map):
-            result[original_idx] = translated_lines[translated_idx].strip()
+            line_num = translated_idx + 1
+            if line_num in translated_texts_by_number:
+                result[original_idx] = translated_texts_by_number[line_num]
+            else:
+                logger.warning(f"Missing line {line_num} in GPT response, using original")
+                result[original_idx] = non_empty_texts[translated_idx]
         
         # Preserve empty strings in their original positions
         for empty_idx in empty_positions:
@@ -754,7 +889,30 @@ class VideoSubtitleProcessor:
             
             for attempt in range(max_retries):
                 try:
-                    translated_text = self.translator.translate(text)
+                    if self.translator_backend == "deepl":
+                        # DeepL translation
+                        translated_text = self.translator.translate(text)
+                    elif self.translator_backend == "gpt":
+                        # GPT translation with Responses API
+                        response = self.translator.responses.create(
+                            model="gpt-5-mini",
+                            # temperature parameter removed - GPT-5-mini doesn't support it
+                            input=[
+                                {"role": "system", "content": GPT_SYSTEM_PROMPT},
+                                {"role": "user", "content": f"TEXT:\n{text}"}
+                            ]
+                        )
+                        
+                        # Log actual token usage if available
+                        if hasattr(response, "usage") and response.usage:
+                            logger.debug(
+                                f"GPT usage (fallback) | input={response.usage.input_tokens} "
+                                f"output={response.usage.output_tokens} "
+                                f"total={response.usage.input_tokens + response.usage.output_tokens}"
+                            )
+                        
+                        translated_text = response.output_text.strip()
+                    
                     if translated_text:
                         break
                 except Exception as e:
@@ -804,24 +962,71 @@ class VideoSubtitleProcessor:
         # Prepare all texts for batch translation
         segment_texts = [segment.get("text", "").strip() for segment in segments]
         
-        # Translate in batches
-        logger.info(f"Translating {total_segments} segments in batches of {batch_size}...")
+        # Create character-based batches (more reliable for GPT token limits)
+        batches = []
+        current_batch = []
+        current_chars = 0
+        
+        for text in segment_texts:
+            text_chars = len(text)
+            
+            # If adding this text would exceed limit, start new batch
+            # Account for newline characters between segments
+            newline_chars = len(current_batch)  # One newline per existing segment
+            if current_batch and (current_chars + text_chars + newline_chars) > self.MAX_CHARS_PER_BATCH:
+                batches.append(current_batch)
+                current_batch = [text]
+                current_chars = text_chars
+            else:
+                current_batch.append(text)
+                current_chars += text_chars
+        
+        # Add final batch if not empty
+        if current_batch:
+            batches.append(current_batch)
+        
+        # Translate in character-based batches
+        total_batches = len(batches)
+        logger.info(f"Translating {total_segments} segments in {total_batches} character-based batches (max {self.MAX_CHARS_PER_BATCH} chars/batch)...")
         translated_texts = []
         
-        for i in range(0, len(segment_texts), batch_size):
-            batch = segment_texts[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            total_batches = (len(segment_texts) + batch_size - 1) // batch_size
-            
-            logger.info(f"Translating batch {batch_num}/{total_batches} ({len(batch)} segments)...")
+        for batch_num, batch in enumerate(batches, 1):
+            batch_chars = sum(len(text) for text in batch) + len(batch) - 1  # + newlines
+            logger.info(f"Translating batch {batch_num}/{total_batches} ({len(batch)} segments, ~{batch_chars} chars)...")
             translated_batch = self._translate_batch(batch)
             translated_texts.extend(translated_batch)
         
-        # Write SRT file
+        # Two-pass approach for silence freeze fix and overlap prevention
+        # First pass: Calculate adjusted end times
+        adjusted_ends = []
+        for i, segment in enumerate(segments):
+            original_end = segment["end"]
+            adjusted_end = original_end
+            
+            # Check for long silence gap after this segment
+            if i < len(segments) - 1:
+                next_start = segments[i + 1]["start"]
+                gap = next_start - original_end
+                
+                if gap > self.SILENCE_GAP_THRESHOLD:
+                    # Close subtitle early to prevent freeze during silence
+                    adjusted_end = next_start - 0.1
+                    logger.debug(f"Closing subtitle {i+1} early due to {gap:.2f}s silence gap")
+            
+            # Prevent overlap with next segment
+            if i < len(segments) - 1:
+                next_start = segments[i + 1]["start"]
+                if adjusted_end > next_start:
+                    adjusted_end = next_start - 0.05
+                    logger.debug(f"Adjusted subtitle {i+1} end time to prevent overlap")
+            
+            adjusted_ends.append(adjusted_end)
+        
+        # Second pass: Write SRT file with adjusted times
         with open(srt_path, "w", encoding="utf-8") as f:
-            for i, (segment, translated_text) in enumerate(zip(segments, translated_texts), start=1):
+            for i, (segment, translated_text, adjusted_end) in enumerate(zip(segments, translated_texts, adjusted_ends), start=1):
                 start_time = self._format_timestamp(segment["start"])
-                end_time = self._format_timestamp(segment["end"])
+                end_time = self._format_timestamp(adjusted_end)
                 
                 # Post-process translation for better subtitle tone
                 translated_text = self._improve_translation(translated_text)
@@ -871,21 +1076,13 @@ class VideoSubtitleProcessor:
     
     def _improve_translation(self, text: str) -> str:
         """
-        Post-process DeepL translation to make subtitles more concise and suited 
-        for espionage/drama content (Le Bureau des Légendes style).
+        Post-process translation based on translator backend.
         
-        Applies heuristics:
-        - Removes polite phrases
-        - Removes leading pronouns
-        - Removes exclamation marks
-        - Converts short questions to statements
-        - Removes time fillers
-        - Applies spy terminology dictionary
-        - Adds tension to short sentences
-        - Shortens overly long sentences
+        For GPT: Light cleanup only (whitespace normalization, punctuation fixes)
+        For DeepL: Aggressive processing for espionage/drama content style
         
         Args:
-            text: Translated text from DeepL
+            text: Translated text
             
         Returns:
             Improved text
@@ -895,6 +1092,16 @@ class VideoSubtitleProcessor:
         
         result = text.strip()
         
+        # Light cleanup for both translators
+        result = re.sub(r'\s+', ' ', result).strip()  # Normalize whitespace
+        
+        # GPT: Only light cleanup, no aggressive processing
+        if self.translator_backend == "gpt":
+            # Basic punctuation fixes
+            result = re.sub(r'\s+([,.!?;:])', r'\1', result)  # Remove space before punctuation
+            return result
+        
+        # DeepL: Aggressive processing (original behavior)
         # 1. Remove polite phrases
         polite_phrases = ["Lütfen", "Endişelenmeyin", "Sorun değil", "Merhaba", "İyi günler"]
         for phrase in polite_phrases:
@@ -1005,21 +1212,31 @@ class VideoSubtitleProcessor:
         # Prepare SRT path for FFmpeg
         srt_escaped = self._prepare_srt_path_for_ffmpeg(srt_path)
         
-        # Build FFmpeg command for subtitle burning
+        # Build FFmpeg command for subtitle burning with Netflix-like styling
         # Windows requires proper escaping: use single quotes around path, escape single quotes in path
+        # Netflix-like style: larger font, shadow, margins for better readability
+        style_params = (
+            "FontSize=28,"  # Larger font for TV/laptop viewing
+            "PrimaryColour=&Hffffff,"  # White text
+            "OutlineColour=&H000000,"  # Black outline
+            "Outline=2,"  # Outline thickness
+            "Shadow=1,"  # Enable shadow
+            "ShadowX=2,"  # Shadow X offset
+            "ShadowY=2,"  # Shadow Y offset
+            "MarginV=30"  # Bottom margin for better positioning
+        )
+        
         if os.name == 'nt':  # Windows
             # Escape single quotes in path and wrap in single quotes
             srt_escaped_quoted = srt_escaped.replace("'", "'\\''")
             subtitle_filter = (
                 f"subtitles='{srt_escaped_quoted}':"
-                f"force_style='FontSize=24,PrimaryColour=&Hffffff,"
-                f"OutlineColour=&H000000,Outline=2'"
+                f"force_style='{style_params}'"
             )
         else:
             subtitle_filter = (
                 f"subtitles={srt_escaped}:"
-                f"force_style='FontSize=24,PrimaryColour=&Hffffff,"
-                f"OutlineColour=&H000000,Outline=2'"
+                f"force_style='{style_params}'"
             )
         
         # Detect hardware encoder for faster encoding
@@ -1180,14 +1397,26 @@ class VideoSubtitleProcessor:
             
             # Save soft subtitle file if requested
             if self.soft_subtitles:
-                soft_subtitle_path = self.translated_videos_dir / f"{Path(output_filename).stem}.srt"
+                # Select output directory based on translator
+                if self.translator_backend == "gpt":
+                    soft_dir = self.gpt_translated_dir
+                else:
+                    soft_dir = self.translated_videos_dir
+                
+                soft_subtitle_path = soft_dir / f"{Path(output_filename).stem}.srt"
                 shutil.copy2(srt_path, soft_subtitle_path)
                 results['subtitle'] = str(soft_subtitle_path)
                 logger.info(f"Soft subtitle file saved to: {soft_subtitle_path}")
             
             # Step 5: Burn subtitles into video (if requested)
             if self.burn_subtitles:
-                final_output = self.translated_videos_dir / output_filename
+                # Select output directory based on translator
+                if self.translator_backend == "gpt":
+                    output_dir = self.gpt_translated_dir
+                else:
+                    output_dir = self.translated_videos_dir
+                
+                final_output = output_dir / output_filename
                 final_output.parent.mkdir(parents=True, exist_ok=True)
                 final_video_path = self._burn_subtitles_into_video(video_path, str(srt_path), str(final_output))
                 results['final'] = final_video_path
@@ -1241,7 +1470,7 @@ def main():
         "--batch-size",
         type=int,
         default=VideoSubtitleProcessor.TRANSLATION_BATCH_SIZE,
-        help=f"Translation batch size (default: {VideoSubtitleProcessor.TRANSLATION_BATCH_SIZE})"
+        help=f"Translation batch size in segments (legacy, character-based batching is used for GPT, default: {VideoSubtitleProcessor.TRANSLATION_BATCH_SIZE})"
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -1249,9 +1478,25 @@ def main():
         help="Enable verbose logging"
     )
     parser.add_argument(
+        "--translator",
+        choices=["deepl", "gpt"],
+        default="gpt",  # GPT-5-mini as default, DeepL must be explicitly selected
+        help="Translation backend: 'deepl' or 'gpt' (default: gpt)"
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="OpenAI API key for translation. If not provided, will use OPENAI_API_KEY environment variable."
+    )
+    parser.add_argument(
         "--deepl-api-key",
         default=None,
-        help="DeepL API key for translation. If not provided, will be asked interactively."
+        help="DeepL API key for translation. If not provided, will use DEEPL_API_KEY environment variable."
+    )
+    parser.add_argument(
+        "--cookies",
+        default=None,
+        help="Path to cookies.txt file for YouTube age-restricted videos"
     )
     
     args = parser.parse_args()
@@ -1260,19 +1505,134 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Interactively ask for video URL if not provided
-    video_url = args.video_url
-    if not video_url:
-        print("=" * 60)
-        print("Video Subtitle Processor")
-        print("=" * 60)
-        video_url = input("\n📹 Video URL'ini girin (YouTube, m3u8, mp4): ").strip()
-        if not video_url:
-            print("❌ Hata: Video URL girilmedi!")
+    # Get API keys based on translator selection
+    openai_api_key = args.openai_api_key or os.environ.get('OPENAI_API_KEY')
+    deepl_api_key = args.deepl_api_key or os.environ.get('DEEPL_API_KEY')
+    
+    # Validate API key based on translator selection
+    if args.translator == "gpt":
+        if not openai_api_key:
+            print("❌ Hata: OpenAI API key gerekli!", file=sys.stderr)
+            print("   Lütfen aşağıdaki yöntemlerden birini kullanın:", file=sys.stderr)
+            print("   1. --openai-api-key parametresi ile: --openai-api-key YOUR_KEY", file=sys.stderr)
+            print("   2. OPENAI_API_KEY environment variable ile", file=sys.stderr)
+            print("   API key almak için: https://platform.openai.com/api-keys", file=sys.stderr)
+            sys.exit(1)
+    elif args.translator == "deepl":
+        if not deepl_api_key:
+            print("❌ Hata: DeepL API key gerekli!", file=sys.stderr)
+            print("   Lütfen aşağıdaki yöntemlerden birini kullanın:", file=sys.stderr)
+            print("   1. --deepl-api-key parametresi ile: --deepl-api-key YOUR_KEY", file=sys.stderr)
+            print("   2. DEEPL_API_KEY environment variable ile", file=sys.stderr)
+            print("   API key almak için: https://www.deepl.com/pro-api", file=sys.stderr)
             sys.exit(1)
     
-    # Interactively ask for output filename if not provided
+    # Interactively collect video list if not provided
+    video_url = args.video_url
     output_filename = args.output
+    
+    if not video_url:
+        print("=" * 60)
+        print("Video Subtitle Processor - İnteraktif Mod")
+        print("=" * 60)
+        print("\n📝 Birden fazla video işlemek için sırayla URL ve isim girin.")
+        print("   Tüm videoları girdikten sonra URL kısmını boş bırakıp Enter'a basın.\n")
+        
+        videos = []
+        video_num = 1
+        
+        while True:
+            url = input(f"📹 Video {video_num} URL'ini girin (boş bırakıp Enter = bitir): ").strip()
+            if not url:
+                break
+            
+            name = input(f"💾 Video {video_num} için çıktı dosya adı: ").strip()
+            if not name:
+                print("⚠️  İsim boş olamaz, tekrar deneyin.")
+                continue
+            
+            # Add .mp4 extension if not present
+            if not name.lower().endswith('.mp4'):
+                name += '.mp4'
+            
+            videos.append({'url': url, 'name': name})
+            video_num += 1
+            print()
+        
+        if not videos:
+            print("❌ Hata: Hiç video girilmedi!")
+            sys.exit(1)
+        
+        # Show summary
+        print("\n" + "=" * 60)
+        print(f"✅ Toplam {len(videos)} video eklendi:")
+        for i, video in enumerate(videos, 1):
+            print(f"   {i}. {video['name']}")
+        print("=" * 60)
+        
+        # Confirm before processing
+        input("\n🚀 İşleme başlamak için Enter'a basın...")
+        print()
+        
+        # Process all videos
+        successful = 0
+        failed = 0
+        
+        cookies_path = args.cookies
+        
+        with VideoSubtitleProcessor(
+            whisper_model=args.model,
+            burn_subtitles=not args.no_burn,
+            soft_subtitles=args.soft_subtitles,
+            openai_api_key=openai_api_key,
+            deepl_api_key=deepl_api_key,
+            translator=args.translator
+        ) as processor:
+            processor.cookies_path = cookies_path
+            for i, video in enumerate(videos, 1):
+                print("\n" + "=" * 60)
+                print(f"📹 Video {i}/{len(videos)} işleniyor: {video['name']}")
+                print("=" * 60)
+                print(f"   URL: {video['url']}")
+                print()
+                
+                try:
+                    results = processor.process_video(video['url'], video['name'])
+                    print(f"\n✅ Video {i} başarıyla işlendi: {video['name']}")
+                    successful += 1
+                except KeyboardInterrupt:
+                    print(f"\n⚠️  İşlem kullanıcı tarafından durduruldu.")
+                    print(f"   Video {i} işlenemedi: {video['name']}")
+                    failed += 1
+                    raise  # Re-raise to allow user to stop all processing
+                except Exception as e:
+                    logger.error(f"Video {i} işlenirken hata: {e}", exc_info=True)
+                    print(f"\n❌ Video {i} işlenirken hata oluştu: {video['name']}")
+                    print(f"   Hata: {str(e)}")
+                    print(f"   ⏭️  Diğer videolara geçiliyor...\n")
+                    failed += 1
+                    continue  # Continue with next video
+        
+        # Final summary
+        print("\n" + "=" * 60)
+        print("📊 İŞLEM ÖZETİ")
+        print("=" * 60)
+        print(f"   ✅ Başarılı: {successful}")
+        print(f"   ❌ Başarısız: {failed}")
+        print(f"   📹 Toplam: {len(videos)}")
+        print("=" * 60)
+        
+        # Don't exit on failures - just show summary
+        # All videos were attempted, continue normally
+        if successful == 0:
+            print("\n⚠️  Hiçbir video işlenemedi!")
+            sys.exit(1)
+        elif failed > 0:
+            print(f"\n⚠️  {failed} video işlenemedi, ancak {successful} video başarıyla tamamlandı.")
+        
+        return
+    
+    # Single video mode (original behavior)
     if not output_filename:
         output_filename = input("💾 Çıktı dosya adını girin (örn: video_tr.mp4) [Enter = output_with_subtitles.mp4]: ").strip()
         if not output_filename:
@@ -1281,21 +1641,24 @@ def main():
         if not output_filename.lower().endswith('.mp4'):
             output_filename += '.mp4'
     
-    # Use DeepL API key from argument, environment variable, or default
-    deepl_api_key = args.deepl_api_key or os.environ.get('DEEPL_API_KEY', '4c12d0bb-256e-4b91-abd3-768bb8116f97:fx')
-    
     print(f"\n🚀 İşlem başlatılıyor...")
     print(f"   URL: {video_url}")
     print(f"   Çıktı: {output_filename}")
-    print(f"   Çeviri: DeepL\n")
+    translator_name = "GPT (gpt-5-mini)" if args.translator == "gpt" else "DeepL"
+    print(f"   Çeviri: {translator_name}\n")
     
     # Create processor with context manager for automatic cleanup
+    cookies_path = args.cookies
+    
     with VideoSubtitleProcessor(
         whisper_model=args.model,
         burn_subtitles=not args.no_burn,
         soft_subtitles=args.soft_subtitles,
-        deepl_api_key=deepl_api_key
+        openai_api_key=openai_api_key,
+        deepl_api_key=deepl_api_key,
+        translator=args.translator
     ) as processor:
+        processor.cookies_path = cookies_path
         try:
             results = processor.process_video(video_url, output_filename)
             print("\n" + "=" * 60)

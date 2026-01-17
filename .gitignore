@@ -36,3 +36,7 @@ Thumbs.db
 # Model files (Whisper downloads models automatically)
 *.pt
 *.bin
+
+# Environment variables
+.env
+
